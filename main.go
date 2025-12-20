@@ -95,14 +95,9 @@ func (a *app) handleQuery(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	query := strings.TrimSpace(req.Query)
-	if query == "" {
-		respondJSON(w, http.StatusBadRequest, queryResponse{Error: "query is required"})
-		return
-	}
-	lower := strings.ToLower(query)
-	if !strings.HasPrefix(lower, "select") && !strings.HasPrefix(lower, "with") {
-		respondJSON(w, http.StatusBadRequest, queryResponse{Error: "only SELECT / CTE queries are allowed"})
+	query, err := validateSelectQuery(req.Query)
+	if err != nil {
+		respondJSON(w, http.StatusBadRequest, queryResponse{Error: err.Error()})
 		return
 	}
 
@@ -134,12 +129,8 @@ func (a *app) handleQuery(w http.ResponseWriter, r *http.Request) {
 			resp.More = true
 			break
 		}
-		values := make([]any, len(columns))
-		ptrs := make([]any, len(columns))
-		for i := range values {
-			ptrs[i] = &values[i]
-		}
-		if err := rows.Scan(ptrs...); err != nil {
+		values, err := scanRow(rows, len(columns))
+		if err != nil {
 			respondJSON(w, http.StatusInternalServerError, queryResponse{Error: err.Error()})
 			return
 		}
@@ -168,14 +159,9 @@ func (a *app) handleExportCSV(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	query := strings.TrimSpace(req.Query)
-	if query == "" {
-		http.Error(w, "query is required", http.StatusBadRequest)
-		return
-	}
-	lower := strings.ToLower(query)
-	if !strings.HasPrefix(lower, "select") && !strings.HasPrefix(lower, "with") {
-		http.Error(w, "only SELECT / CTE queries are allowed", http.StatusBadRequest)
+	query, err := validateSelectQuery(req.Query)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
@@ -206,12 +192,8 @@ func (a *app) handleExportCSV(w http.ResponseWriter, r *http.Request) {
 	}
 
 	for rows.Next() {
-		values := make([]any, len(columns))
-		ptrs := make([]any, len(columns))
-		for i := range values {
-			ptrs[i] = &values[i]
-		}
-		if err := rows.Scan(ptrs...); err != nil {
+		values, err := scanRow(rows, len(columns))
+		if err != nil {
 			return
 		}
 		record := make([]string, len(columns))
@@ -262,6 +244,33 @@ func clampLimit(limit int) int {
 		return maxLimit
 	}
 	return limit
+}
+
+var errEmptyQuery = fmt.Errorf("query is required")
+var errNotSelectQuery = fmt.Errorf("only SELECT / CTE queries are allowed")
+
+func validateSelectQuery(raw string) (string, error) {
+	query := strings.TrimSpace(raw)
+	if query == "" {
+		return "", errEmptyQuery
+	}
+	lower := strings.ToLower(query)
+	if !strings.HasPrefix(lower, "select") && !strings.HasPrefix(lower, "with") {
+		return "", errNotSelectQuery
+	}
+	return query, nil
+}
+
+func scanRow(rows *sql.Rows, numCols int) ([]any, error) {
+	values := make([]any, numCols)
+	ptrs := make([]any, numCols)
+	for i := range values {
+		ptrs[i] = &values[i]
+	}
+	if err := rows.Scan(ptrs...); err != nil {
+		return nil, err
+	}
+	return values, nil
 }
 
 func env(key, fallback string) string {
