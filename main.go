@@ -3,7 +3,9 @@ package main
 import (
 	"context"
 	"database/sql"
+	"encoding/csv"
 	"encoding/json"
+	"fmt"
 	"html/template"
 	"log"
 	"net/http"
@@ -64,6 +66,7 @@ func main() {
 	r := chi.NewRouter()
 	r.Get("/", app.handleIndex)
 	r.Post("/query", app.handleQuery)
+	r.Post("/export", app.handleExportCSV)
 
 	log.Printf("listening on %s (driver=%s)", addr, driver)
 	if err := http.ListenAndServe(addr, r); err != nil {
@@ -151,6 +154,87 @@ func (a *app) handleQuery(w http.ResponseWriter, r *http.Request) {
 	resp.DurationMs = time.Since(start).Milliseconds()
 
 	respondJSON(w, http.StatusOK, resp)
+}
+
+// TODO(shared-use): Improve CSV filename to include table name and date (e.g., "anrok_transactions_2025-12-20.csv").
+// Considerations: complex queries (joins, CTEs, subqueries) make table extraction non-trivial.
+// Options: user-provided filename, timestamp-only fallback, or server-side SQL parsing.
+func (a *app) handleExportCSV(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Query string `json:"query"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid JSON body", http.StatusBadRequest)
+		return
+	}
+
+	query := strings.TrimSpace(req.Query)
+	if query == "" {
+		http.Error(w, "query is required", http.StatusBadRequest)
+		return
+	}
+	lower := strings.ToLower(query)
+	if !strings.HasPrefix(lower, "select") && !strings.HasPrefix(lower, "with") {
+		http.Error(w, "only SELECT / CTE queries are allowed", http.StatusBadRequest)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), queryTimeout)
+	defer cancel()
+
+	rows, err := a.db.QueryContext(ctx, query)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	defer rows.Close()
+
+	columns, err := rows.Columns()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/csv")
+	w.Header().Set("Content-Disposition", "attachment; filename=export.csv")
+
+	csvWriter := csv.NewWriter(w)
+	defer csvWriter.Flush()
+
+	if err := csvWriter.Write(columns); err != nil {
+		return
+	}
+
+	for rows.Next() {
+		values := make([]any, len(columns))
+		ptrs := make([]any, len(columns))
+		for i := range values {
+			ptrs[i] = &values[i]
+		}
+		if err := rows.Scan(ptrs...); err != nil {
+			return
+		}
+		record := make([]string, len(columns))
+		for i, v := range values {
+			record[i] = formatCSVValue(v)
+		}
+		if err := csvWriter.Write(record); err != nil {
+			return
+		}
+	}
+}
+
+func formatCSVValue(v any) string {
+	switch val := v.(type) {
+	case nil:
+		return ""
+	case []byte:
+		return string(val)
+	case time.Time:
+		return val.Format(time.RFC3339)
+	default:
+		return fmt.Sprintf("%v", val)
+	}
 }
 
 func normalizeRow(values []any) []any {
@@ -316,6 +400,24 @@ var indexHTML = `
       opacity: 0.5;
       cursor: not-allowed;
     }
+    .export-row {
+      display: flex;
+      justify-content: flex-end;
+      margin-top: 12px;
+    }
+    .export-btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      background: transparent;
+      color: var(--muted);
+      border: 1px solid var(--border);
+      padding: 8px 12px;
+      font-size: 13px;
+      min-width: auto;
+    }
+    .export-btn:hover { color: var(--text); background: rgba(255,255,255,0.05); }
+    .export-btn:active { background: rgba(255,255,255,0.08); }
     .status {
       font-size: 13px;
       color: var(--muted);
@@ -402,6 +504,15 @@ var indexHTML = `
         <table id="resultsTable" aria-live="polite"></table>
         <div class="empty" id="emptyState">Run a query to see rows.</div>
       </div>
+      <div class="export-row">
+        <button type="button" id="exportButton" class="export-btn" disabled>
+          <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M8 10V2M8 10L5 7M8 10L11 7"/>
+            <path d="M2 10v3a1 1 0 001 1h10a1 1 0 001-1v-3"/>
+          </svg>
+          CSV
+        </button>
+      </div>
     </section>
   </main>
 
@@ -413,6 +524,7 @@ var indexHTML = `
     const emptyState = document.getElementById('emptyState');
     const statusText = document.getElementById('statusText');
     const runButton = document.getElementById('runButton');
+    const exportButton = document.getElementById('exportButton');
     const fallbackLimit = {{.DefaultLimit}};
 
     form.addEventListener('submit', (e) => {
@@ -426,6 +538,8 @@ var indexHTML = `
         runQuery();
       }
     });
+
+    exportButton.addEventListener('click', exportCSV);
 
     async function runQuery() {
       const query = queryInput.value.trim();
@@ -450,10 +564,13 @@ var indexHTML = `
         const data = await res.json();
         if (!res.ok || data.error) {
           setStatus(data.error || 'Server error', 'error');
+          exportButton.disabled = true;
           return;
         }
 
-        renderTable(data.columns || [], data.rows || []);
+        const rows = data.rows || [];
+        renderTable(data.columns || [], rows);
+        exportButton.disabled = rows.length === 0;
         const parts = [];
         parts.push(data.count + ' row' + (data.count === 1 ? '' : 's'));
         if (data.more) parts.push('truncated');
@@ -462,8 +579,50 @@ var indexHTML = `
       } catch (err) {
         console.error(err);
         setStatus('Request failed. Check the server logs.', 'error');
+        exportButton.disabled = true;
       } finally {
         toggleLoading(false);
+      }
+    }
+
+    async function exportCSV() {
+      const query = queryInput.value.trim();
+      if (!query) {
+        setStatus('Enter a query to export.', 'error');
+        return;
+      }
+
+      setStatus('Exporting CSV...', 'muted');
+      exportButton.disabled = true;
+
+      try {
+        const res = await fetch('/export', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ query })
+        });
+
+        if (!res.ok) {
+          const text = await res.text();
+          setStatus(text || 'Export failed', 'error');
+          return;
+        }
+
+        const blob = await res.blob();
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = 'export.csv';
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+        setStatus('CSV downloaded', 'success');
+      } catch (err) {
+        console.error(err);
+        setStatus('Export failed. Check the server logs.', 'error');
+      } finally {
+        exportButton.disabled = false;
       }
     }
 
