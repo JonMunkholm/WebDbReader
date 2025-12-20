@@ -1,0 +1,529 @@
+package main
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"html/template"
+	"log"
+	"net/http"
+	"os"
+	"strings"
+	"time"
+
+	"github.com/go-chi/chi/v5"
+	"github.com/joho/godotenv"
+	_ "github.com/lib/pq"
+)
+
+const (
+	defaultAddr         = ":8080"
+	defaultLimit        = 200
+	maxLimit            = 1000
+	queryTimeout        = 8 * time.Second
+	defaultExampleQuery = "SELECT 1 AS id, 'hello' AS greeting;"
+)
+
+type app struct {
+	db   *sql.DB
+	tmpl *template.Template
+}
+
+type queryRequest struct {
+	Query string `json:"query"`
+	Limit int    `json:"limit"`
+}
+
+type queryResponse struct {
+	Columns    []string `json:"columns"`
+	Rows       [][]any  `json:"rows"`
+	Count      int      `json:"count"`
+	More       bool     `json:"more"`
+	DurationMs int64    `json:"durationMs"`
+	Error      string   `json:"error,omitempty"`
+}
+
+func main() {
+	_ = godotenv.Load() // loads .env if present, silently ignores if not
+
+	driver := env("DB_DRIVER", "postgres")
+	dsn := env("DB_DSN", "postgres://localhost/postgres?sslmode=disable")
+	addr := env("ADDR", defaultAddr)
+
+	db, err := sql.Open(driver, dsn)
+	if err != nil {
+		log.Fatalf("open database: %v", err)
+	}
+	if err := db.Ping(); err != nil {
+		log.Fatalf("ping database: %v", err)
+	}
+
+	tmpl := template.Must(template.New("index").Parse(indexHTML))
+	app := &app{db: db, tmpl: tmpl}
+
+	r := chi.NewRouter()
+	r.Get("/", app.handleIndex)
+	r.Post("/query", app.handleQuery)
+
+	log.Printf("listening on %s (driver=%s)", addr, driver)
+	if err := http.ListenAndServe(addr, r); err != nil {
+		log.Fatal(err)
+	}
+}
+
+func (a *app) handleIndex(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	data := struct {
+		DefaultQuery string
+		DefaultLimit int
+	}{
+		DefaultQuery: defaultExampleQuery,
+		DefaultLimit: defaultLimit,
+	}
+	if err := a.tmpl.Execute(w, data); err != nil {
+		http.Error(w, "template error", http.StatusInternalServerError)
+	}
+}
+
+func (a *app) handleQuery(w http.ResponseWriter, r *http.Request) {
+	var req queryRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		respondJSON(w, http.StatusBadRequest, queryResponse{Error: "invalid JSON body"})
+		return
+	}
+
+	query := strings.TrimSpace(req.Query)
+	if query == "" {
+		respondJSON(w, http.StatusBadRequest, queryResponse{Error: "query is required"})
+		return
+	}
+	lower := strings.ToLower(query)
+	if !strings.HasPrefix(lower, "select") && !strings.HasPrefix(lower, "with") {
+		respondJSON(w, http.StatusBadRequest, queryResponse{Error: "only SELECT / CTE queries are allowed"})
+		return
+	}
+
+	limit := clampLimit(req.Limit)
+
+	ctx, cancel := context.WithTimeout(r.Context(), queryTimeout)
+	defer cancel()
+
+	start := time.Now()
+	rows, err := a.db.QueryContext(ctx, query)
+	if err != nil {
+		respondJSON(w, http.StatusBadRequest, queryResponse{Error: err.Error()})
+		return
+	}
+	defer rows.Close()
+
+	columns, err := rows.Columns()
+	if err != nil {
+		respondJSON(w, http.StatusInternalServerError, queryResponse{Error: err.Error()})
+		return
+	}
+
+	resp := queryResponse{
+		Columns: columns,
+	}
+
+	for rows.Next() {
+		if len(resp.Rows) >= limit {
+			resp.More = true
+			break
+		}
+		values := make([]any, len(columns))
+		ptrs := make([]any, len(columns))
+		for i := range values {
+			ptrs[i] = &values[i]
+		}
+		if err := rows.Scan(ptrs...); err != nil {
+			respondJSON(w, http.StatusInternalServerError, queryResponse{Error: err.Error()})
+			return
+		}
+		resp.Rows = append(resp.Rows, normalizeRow(values))
+	}
+	if err := rows.Err(); err != nil {
+		respondJSON(w, http.StatusInternalServerError, queryResponse{Error: err.Error()})
+		return
+	}
+
+	resp.Count = len(resp.Rows)
+	resp.DurationMs = time.Since(start).Milliseconds()
+
+	respondJSON(w, http.StatusOK, resp)
+}
+
+func normalizeRow(values []any) []any {
+	row := make([]any, len(values))
+	for i, v := range values {
+		switch val := v.(type) {
+		case nil:
+			row[i] = nil
+		case []byte:
+			row[i] = string(val)
+		case time.Time:
+			row[i] = val.Format(time.RFC3339Nano)
+		default:
+			row[i] = val
+		}
+	}
+	return row
+}
+
+func clampLimit(limit int) int {
+	if limit <= 0 {
+		return defaultLimit
+	}
+	if limit > maxLimit {
+		return maxLimit
+	}
+	return limit
+}
+
+func env(key, fallback string) string {
+	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
+		return v
+	}
+	return fallback
+}
+
+func respondJSON(w http.ResponseWriter, status int, payload queryResponse) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(payload)
+}
+
+// indexHTML is a small, self-contained UI for running ad-hoc queries.
+var indexHTML = `
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>DB Reader</title>
+  <style>
+    :root {
+      --bg: #0b1224;
+      --panel: #0f172a;
+      --panel-2: #111827;
+      --text: #e2e8f0;
+      --muted: #94a3b8;
+      --accent: #7dd3fc;
+      --border: #1e293b;
+      --danger: #fca5a5;
+      --success: #a7f3d0;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Space Grotesk", "Inter", "Segoe UI", system-ui, -apple-system, sans-serif;
+      background: radial-gradient(circle at 10% 20%, rgba(125, 211, 252, 0.08), transparent 25%),
+                  radial-gradient(circle at 90% 10%, rgba(147, 51, 234, 0.06), transparent 25%),
+                  radial-gradient(circle at 40% 80%, rgba(16, 185, 129, 0.08), transparent 25%),
+                  var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+    }
+    main {
+      max-width: 1100px;
+      margin: 0 auto;
+      padding: 48px 24px 64px;
+    }
+    header {
+      display: flex;
+      justify-content: space-between;
+      align-items: baseline;
+      gap: 12px;
+      margin-bottom: 22px;
+    }
+    h1 {
+      font-size: 28px;
+      letter-spacing: -0.02em;
+      margin: 0;
+    }
+    p.lead {
+      margin: 4px 0 0;
+      color: var(--muted);
+    }
+    .card {
+      background: linear-gradient(160deg, rgba(255,255,255,0.04), rgba(255,255,255,0));
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 18px;
+      box-shadow: 0 10px 40px rgba(0,0,0,0.25);
+    }
+    form {
+      display: grid;
+      gap: 12px;
+    }
+    label {
+      font-size: 13px;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+    textarea {
+      width: 100%;
+      min-height: 170px;
+      resize: vertical;
+      padding: 14px;
+      border-radius: 14px;
+      border: 1px solid var(--border);
+      background: var(--panel);
+      color: var(--text);
+      font-size: 14px;
+      line-height: 1.45;
+      font-family: "JetBrains Mono", "SFMono-Regular", "Menlo", monospace;
+    }
+    textarea:focus {
+      outline: 2px solid rgba(125, 211, 252, 0.35);
+      border-color: rgba(125, 211, 252, 0.4);
+    }
+    .controls {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      flex-wrap: wrap;
+      justify-content: space-between;
+    }
+    .control-group {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+    input[type="number"] {
+      width: 90px;
+      padding: 8px 10px;
+      border-radius: 10px;
+      border: 1px solid var(--border);
+      background: var(--panel);
+      color: var(--text);
+    }
+    button {
+      appearance: none;
+      border: 0;
+      background: linear-gradient(120deg, #22d3ee, #6366f1);
+      color: #0b1224;
+      padding: 12px 18px;
+      border-radius: 12px;
+      font-weight: 700;
+      font-size: 14px;
+      cursor: pointer;
+      min-width: 140px;
+      box-shadow: 0 10px 25px rgba(99, 102, 241, 0.28);
+      transition: transform 0.1s ease, box-shadow 0.15s ease;
+    }
+    button:hover { transform: translateY(-1px); box-shadow: 0 14px 30px rgba(99, 102, 241, 0.34); }
+    button:active { transform: translateY(0); box-shadow: 0 8px 18px rgba(99, 102, 241, 0.3); }
+    button:disabled {
+      opacity: 0.7;
+      cursor: not-allowed;
+      transform: none;
+      box-shadow: none;
+    }
+    .status {
+      font-size: 13px;
+      color: var(--muted);
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .status strong { color: var(--text); }
+    .status .error { color: var(--danger); }
+    .status .success { color: var(--success); }
+    .preview {
+      margin-top: 16px;
+      background: var(--panel-2);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 12px;
+      box-shadow: inset 0 1px 0 rgba(255,255,255,0.02);
+    }
+    .table-wrap {
+      max-height: 360px;
+      overflow: auto;
+      border-radius: 10px;
+    }
+    table {
+      border-collapse: collapse;
+      width: 100%;
+      min-width: 420px;
+      font-size: 13px;
+    }
+    th, td {
+      text-align: left;
+      padding: 10px 12px;
+      border-bottom: 1px solid var(--border);
+      white-space: nowrap;
+    }
+    th {
+      position: sticky;
+      top: 0;
+      background: rgba(15, 23, 42, 0.95);
+      z-index: 2;
+      letter-spacing: 0.01em;
+    }
+    tr:nth-child(even) td { background: rgba(255, 255, 255, 0.02); }
+    .empty {
+      color: var(--muted);
+      text-align: center;
+      padding: 18px 0;
+      font-size: 14px;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <div>
+        <h1>DB Reader</h1>
+        <p class="lead">Run ad-hoc SQL and preview results right in the browser.</p>
+      </div>
+      <div class="status" id="statusText"></div>
+    </header>
+
+    <section class="card">
+      <form id="queryForm">
+        <div>
+          <label for="queryInput">SQL Query</label>
+          <textarea id="queryInput" name="query" spellcheck="false">{{.DefaultQuery}}</textarea>
+        </div>
+        <div class="controls">
+          <div class="control-group">
+          <label for="limitInput">Max rows</label>
+          <input id="limitInput" name="limit" type="number" min="1" max="1000" value="{{.DefaultLimit}}" />
+          <span aria-hidden="true" style="color: var(--muted);">•</span>
+          <span class="muted">⌘/Ctrl + Enter to run</span>
+        </div>
+        <button type="submit" id="runButton">Run query</button>
+        </div>
+      </form>
+    </section>
+
+    <section class="preview">
+      <div class="table-wrap">
+        <table id="resultsTable" aria-live="polite"></table>
+        <div class="empty" id="emptyState">Run a query to see rows.</div>
+      </div>
+    </section>
+  </main>
+
+  <script>
+    const form = document.getElementById('queryForm');
+    const queryInput = document.getElementById('queryInput');
+    const limitInput = document.getElementById('limitInput');
+    const resultsTable = document.getElementById('resultsTable');
+    const emptyState = document.getElementById('emptyState');
+    const statusText = document.getElementById('statusText');
+    const runButton = document.getElementById('runButton');
+    const fallbackLimit = {{.DefaultLimit}};
+
+    form.addEventListener('submit', (e) => {
+      e.preventDefault();
+      runQuery();
+    });
+
+    queryInput.addEventListener('keydown', (e) => {
+      if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
+        e.preventDefault();
+        runQuery();
+      }
+    });
+
+    async function runQuery() {
+      const query = queryInput.value.trim();
+      const limit = Number.parseInt(limitInput.value, 10) || fallbackLimit;
+
+      if (!query) {
+        setStatus('Enter a query to run.', 'error');
+        return;
+      }
+
+      setStatus('Running query...', 'muted');
+      toggleLoading(true);
+      clearResults();
+
+      try {
+        const res = await fetch('/query', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ query, limit })
+        });
+
+        const data = await res.json();
+        if (!res.ok || data.error) {
+          setStatus(data.error || 'Server error', 'error');
+          return;
+        }
+
+        renderTable(data.columns || [], data.rows || []);
+        const parts = [];
+        parts.push(data.count + ' row' + (data.count === 1 ? '' : 's'));
+        if (data.more) parts.push('truncated');
+        if (data.durationMs != null) parts.push(data.durationMs + ' ms');
+        setStatus(parts.join(' · '), 'success');
+      } catch (err) {
+        console.error(err);
+        setStatus('Request failed. Check the server logs.', 'error');
+      } finally {
+        toggleLoading(false);
+      }
+    }
+
+    function renderTable(columns, rows) {
+      resultsTable.innerHTML = '';
+      if (!rows.length) {
+        emptyState.textContent = 'No rows returned.';
+        emptyState.style.display = 'block';
+        return;
+      }
+
+      emptyState.style.display = 'none';
+      const thead = document.createElement('thead');
+      const headerRow = document.createElement('tr');
+      columns.forEach(col => {
+        const th = document.createElement('th');
+        th.textContent = col;
+        headerRow.appendChild(th);
+      });
+      thead.appendChild(headerRow);
+
+      const tbody = document.createElement('tbody');
+      rows.forEach(row => {
+        const tr = document.createElement('tr');
+        row.forEach(cell => {
+          const td = document.createElement('td');
+          td.textContent = cell === null ? 'NULL' : String(cell);
+          tr.appendChild(td);
+        });
+        tbody.appendChild(tr);
+      });
+
+      resultsTable.appendChild(thead);
+      resultsTable.appendChild(tbody);
+    }
+
+    function clearResults() {
+      resultsTable.innerHTML = '';
+      emptyState.textContent = 'Running...';
+      emptyState.style.display = 'block';
+    }
+
+    function setStatus(message, tone) {
+      statusText.textContent = message || '';
+      statusText.className = 'status ' + (tone || '');
+    }
+
+    function toggleLoading(isLoading) {
+      runButton.disabled = isLoading;
+      runButton.textContent = isLoading ? 'Running...' : 'Run query';
+    }
+
+    // Autofocus for quick entry.
+    queryInput.focus();
+  </script>
+</body>
+</html>
+`
