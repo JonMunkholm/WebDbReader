@@ -203,24 +203,21 @@ var indexHTML = `
   <title>DB Reader</title>
   <style>
     :root {
-      --bg: #0b1224;
-      --panel: #0f172a;
-      --panel-2: #111827;
+      --bg: #0f1219;
+      --panel: #1a1f2e;
+      --panel-2: #161b26;
       --text: #e2e8f0;
-      --muted: #94a3b8;
-      --accent: #7dd3fc;
-      --border: #1e293b;
-      --danger: #fca5a5;
-      --success: #a7f3d0;
+      --muted: #8892a6;
+      --accent: #3b82f6;
+      --border: #2a3142;
+      --danger: #f87171;
+      --success: #4ade80;
     }
     * { box-sizing: border-box; }
     body {
       margin: 0;
-      font-family: "Space Grotesk", "Inter", "Segoe UI", system-ui, -apple-system, sans-serif;
-      background: radial-gradient(circle at 10% 20%, rgba(125, 211, 252, 0.08), transparent 25%),
-                  radial-gradient(circle at 90% 10%, rgba(147, 51, 234, 0.06), transparent 25%),
-                  radial-gradient(circle at 40% 80%, rgba(16, 185, 129, 0.08), transparent 25%),
-                  var(--bg);
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: var(--bg);
       color: var(--text);
       min-height: 100vh;
     }
@@ -246,11 +243,10 @@ var indexHTML = `
       color: var(--muted);
     }
     .card {
-      background: linear-gradient(160deg, rgba(255,255,255,0.04), rgba(255,255,255,0));
+      background: var(--panel);
       border: 1px solid var(--border);
-      border-radius: 16px;
+      border-radius: 12px;
       padding: 18px;
-      box-shadow: 0 10px 40px rgba(0,0,0,0.25);
     }
     form {
       display: grid;
@@ -273,11 +269,11 @@ var indexHTML = `
       color: var(--text);
       font-size: 14px;
       line-height: 1.45;
-      font-family: "JetBrains Mono", "SFMono-Regular", "Menlo", monospace;
+      font-family: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
     }
     textarea:focus {
-      outline: 2px solid rgba(125, 211, 252, 0.35);
-      border-color: rgba(125, 211, 252, 0.4);
+      outline: none;
+      border-color: var(--accent);
     }
     .controls {
       display: flex;
@@ -304,24 +300,21 @@ var indexHTML = `
     button {
       appearance: none;
       border: 0;
-      background: linear-gradient(120deg, #22d3ee, #6366f1);
-      color: #0b1224;
-      padding: 12px 18px;
-      border-radius: 12px;
-      font-weight: 700;
+      background: var(--accent);
+      color: #fff;
+      padding: 10px 18px;
+      border-radius: 8px;
+      font-weight: 600;
       font-size: 14px;
       cursor: pointer;
-      min-width: 140px;
-      box-shadow: 0 10px 25px rgba(99, 102, 241, 0.28);
-      transition: transform 0.1s ease, box-shadow 0.15s ease;
+      min-width: 120px;
+      transition: background 0.15s ease;
     }
-    button:hover { transform: translateY(-1px); box-shadow: 0 14px 30px rgba(99, 102, 241, 0.34); }
-    button:active { transform: translateY(0); box-shadow: 0 8px 18px rgba(99, 102, 241, 0.3); }
+    button:hover { background: #2563eb; }
+    button:active { background: #1d4ed8; }
     button:disabled {
-      opacity: 0.7;
+      opacity: 0.5;
       cursor: not-allowed;
-      transform: none;
-      box-shadow: none;
     }
     .status {
       font-size: 13px;
@@ -337,9 +330,8 @@ var indexHTML = `
       margin-top: 16px;
       background: var(--panel-2);
       border: 1px solid var(--border);
-      border-radius: 14px;
+      border-radius: 12px;
       padding: 12px;
-      box-shadow: inset 0 1px 0 rgba(255,255,255,0.02);
     }
     .table-wrap {
       max-height: 360px;
@@ -357,6 +349,9 @@ var indexHTML = `
       padding: 10px 12px;
       border-bottom: 1px solid var(--border);
       white-space: nowrap;
+      max-width: 300px;
+      overflow: hidden;
+      text-overflow: ellipsis;
     }
     th {
       position: sticky;
@@ -365,7 +360,7 @@ var indexHTML = `
       z-index: 2;
       letter-spacing: 0.01em;
     }
-    tr:nth-child(even) td { background: rgba(255, 255, 255, 0.02); }
+    tbody tr:hover td { background: rgba(255, 255, 255, 0.04); }
     .empty {
       color: var(--muted);
       text-align: center;
@@ -495,7 +490,9 @@ var indexHTML = `
         const tr = document.createElement('tr');
         row.forEach(cell => {
           const td = document.createElement('td');
-          td.textContent = cell === null ? 'NULL' : String(cell);
+          const text = cell === null ? 'NULL' : String(cell);
+          td.textContent = text;
+          td.title = text;
           tr.appendChild(td);
         });
         tbody.appendChild(tr);
