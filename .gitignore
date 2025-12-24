@@ -1,2 +1,4 @@
 .env
 webdbreader
+LLM_FEATURE_DESIGN.md
+PRODUCTION_READINESS.md

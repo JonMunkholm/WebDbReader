@@ -13,6 +13,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/JonMunkholm/WebDbReader/internal/llm"
+	"github.com/JonMunkholm/WebDbReader/internal/schema"
 	"github.com/go-chi/chi/v5"
 	"github.com/joho/godotenv"
 	_ "github.com/lib/pq"
@@ -27,8 +29,10 @@ const (
 )
 
 type app struct {
-	db   *sql.DB
-	tmpl *template.Template
+	db     *sql.DB
+	tmpl   *template.Template
+	schema *schema.Cache
+	llm    llm.Provider
 }
 
 type queryRequest struct {
@@ -60,13 +64,44 @@ func main() {
 		log.Fatalf("ping database: %v", err)
 	}
 
+	// Initialize schema cache
+	schemaCache := schema.NewCache()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	if err := schemaCache.Load(ctx, db); err != nil {
+		log.Printf("warning: failed to load schema: %v", err)
+	} else {
+		log.Printf("loaded schema: %d tables", schemaCache.TableCount())
+	}
+	cancel()
+
+	// Initialize LLM provider (optional - only if configured)
+	var llmProvider llm.Provider
+	if os.Getenv("LLM_API_KEY") != "" {
+		llmProvider, err = llm.NewProviderFromEnv()
+		if err != nil {
+			log.Printf("warning: failed to initialize LLM: %v", err)
+		} else {
+			log.Printf("LLM provider initialized: %s", llmProvider.Name())
+		}
+	} else {
+		log.Printf("LLM not configured (set LLM_API_KEY to enable)")
+	}
+
 	tmpl := template.Must(template.New("index").Parse(indexHTML))
-	app := &app{db: db, tmpl: tmpl}
+	app := &app{
+		db:     db,
+		tmpl:   tmpl,
+		schema: schemaCache,
+		llm:    llmProvider,
+	}
 
 	r := chi.NewRouter()
 	r.Get("/", app.handleIndex)
 	r.Post("/query", app.handleQuery)
 	r.Post("/export", app.handleExportCSV)
+	r.Post("/generate-sql", app.handleGenerateSQL)
+	r.Get("/schema", app.handleSchema)
+	r.Post("/schema/refresh", app.handleSchemaRefresh)
 
 	log.Printf("listening on %s (driver=%s)", addr, driver)
 	if err := http.ListenAndServe(addr, r); err != nil {
@@ -204,6 +239,107 @@ func (a *app) handleExportCSV(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+}
+
+type generateSQLRequest struct {
+	Prompt string `json:"prompt"`
+}
+
+type generateSQLResponse struct {
+	SQL     string `json:"sql,omitempty"`
+	Missing string `json:"missing,omitempty"`
+	Error   string `json:"error,omitempty"`
+	Tokens  int    `json:"tokens,omitempty"`
+}
+
+func (a *app) handleGenerateSQL(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	if a.llm == nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		json.NewEncoder(w).Encode(generateSQLResponse{
+			Error: "LLM not configured. Set LLM_API_KEY environment variable.",
+		})
+		return
+	}
+
+	var req generateSQLRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(generateSQLResponse{Error: "invalid JSON body"})
+		return
+	}
+
+	if strings.TrimSpace(req.Prompt) == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(generateSQLResponse{Error: "prompt is required"})
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
+	defer cancel()
+
+	llmReq := llm.GenerateRequest{
+		Prompt: req.Prompt,
+		Schema: a.schema.ToText(),
+	}
+
+	resp, err := a.llm.GenerateSQL(ctx, llmReq)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(generateSQLResponse{Error: resp.Error})
+		return
+	}
+
+	if resp.IsMissing() {
+		json.NewEncoder(w).Encode(generateSQLResponse{Missing: resp.Missing, Tokens: resp.Tokens})
+		return
+	}
+
+	// Validate the generated SQL
+	if _, err := validateSelectQuery(resp.SQL); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(generateSQLResponse{
+			Error: "LLM generated invalid query: " + err.Error(),
+		})
+		return
+	}
+
+	json.NewEncoder(w).Encode(generateSQLResponse{SQL: resp.SQL, Tokens: resp.Tokens})
+}
+
+type schemaResponse struct {
+	Tables      []schema.Table `json:"tables"`
+	TableCount  int            `json:"tableCount"`
+	LastRefresh string         `json:"lastRefresh"`
+}
+
+func (a *app) handleSchema(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(schemaResponse{
+		Tables:      a.schema.GetTables(),
+		TableCount:  a.schema.TableCount(),
+		LastRefresh: a.schema.GetLastRefresh().Format(time.RFC3339),
+	})
+}
+
+func (a *app) handleSchemaRefresh(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cancel()
+
+	if err := a.schema.Load(ctx, a.db); err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+
+	json.NewEncoder(w).Encode(schemaResponse{
+		Tables:      a.schema.GetTables(),
+		TableCount:  a.schema.TableCount(),
+		LastRefresh: a.schema.GetLastRefresh().Format(time.RFC3339),
+	})
 }
 
 func formatCSVValue(v any) string {
@@ -478,6 +614,62 @@ var indexHTML = `
       padding: 18px 0;
       font-size: 14px;
     }
+    .nl-section {
+      margin-bottom: 16px;
+    }
+    .nl-input-row {
+      display: flex;
+      gap: 10px;
+      align-items: stretch;
+    }
+    .nl-input {
+      flex: 1;
+      padding: 12px 14px;
+      border-radius: 10px;
+      border: 1px solid var(--border);
+      background: var(--panel);
+      color: var(--text);
+      font-size: 14px;
+    }
+    .nl-input:focus {
+      outline: none;
+      border-color: var(--accent);
+    }
+    .nl-input::placeholder {
+      color: var(--muted);
+    }
+    .generate-btn {
+      background: linear-gradient(135deg, #8b5cf6, #6366f1);
+      white-space: nowrap;
+    }
+    .generate-btn:hover {
+      background: linear-gradient(135deg, #7c3aed, #4f46e5);
+    }
+    .missing-info {
+      margin-top: 12px;
+      padding: 12px 14px;
+      background: rgba(251, 191, 36, 0.1);
+      border: 1px solid rgba(251, 191, 36, 0.3);
+      border-radius: 8px;
+      color: #fbbf24;
+      font-size: 13px;
+    }
+    .divider {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin: 16px 0;
+      color: var(--muted);
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+    .divider::before, .divider::after {
+      content: '';
+      flex: 1;
+      height: 1px;
+      background: var(--border);
+    }
   </style>
 </head>
 <body>
@@ -491,6 +683,17 @@ var indexHTML = `
     </header>
 
     <section class="card">
+      <div class="nl-section">
+        <label for="nlInput">Ask in plain English</label>
+        <div class="nl-input-row">
+          <input type="text" id="nlInput" class="nl-input" placeholder="e.g., Show me the top 10 customers by order count" />
+          <button type="button" id="generateButton" class="generate-btn">Generate SQL</button>
+        </div>
+        <div id="missingInfo" class="missing-info" style="display: none;"></div>
+      </div>
+
+      <div class="divider">or write SQL directly</div>
+
       <form id="queryForm">
         <div>
           <label for="queryInput">SQL Query</label>
@@ -534,6 +737,9 @@ var indexHTML = `
     const statusText = document.getElementById('statusText');
     const runButton = document.getElementById('runButton');
     const exportButton = document.getElementById('exportButton');
+    const nlInput = document.getElementById('nlInput');
+    const generateButton = document.getElementById('generateButton');
+    const missingInfo = document.getElementById('missingInfo');
     const fallbackLimit = {{.DefaultLimit}};
 
     form.addEventListener('submit', (e) => {
@@ -548,7 +754,63 @@ var indexHTML = `
       }
     });
 
+    nlInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        generateSQL();
+      }
+    });
+
+    generateButton.addEventListener('click', generateSQL);
     exportButton.addEventListener('click', exportCSV);
+
+    async function generateSQL() {
+      const prompt = nlInput.value.trim();
+      if (!prompt) {
+        setStatus('Enter a question to generate SQL.', 'error');
+        return;
+      }
+
+      missingInfo.style.display = 'none';
+      setStatus('Generating SQL...', 'muted');
+      generateButton.disabled = true;
+      generateButton.textContent = 'Generating...';
+
+      try {
+        const res = await fetch('/generate-sql', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ prompt })
+        });
+
+        const data = await res.json();
+
+        if (data.error) {
+          setStatus(data.error, 'error');
+          return;
+        }
+
+        if (data.missing) {
+          missingInfo.textContent = data.missing;
+          missingInfo.style.display = 'block';
+          setStatus('Cannot generate query for this request.', 'error');
+          return;
+        }
+
+        if (data.sql) {
+          queryInput.value = data.sql;
+          queryInput.focus();
+          const tokenInfo = data.tokens ? ' (' + data.tokens + ' tokens)' : '';
+          setStatus('SQL generated' + tokenInfo, 'success');
+        }
+      } catch (err) {
+        console.error(err);
+        setStatus('Generation failed. Check the server logs.', 'error');
+      } finally {
+        generateButton.disabled = false;
+        generateButton.textContent = 'Generate SQL';
+      }
+    }
 
     async function runQuery() {
       const query = queryInput.value.trim();
