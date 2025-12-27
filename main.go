@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	_ "embed"
 	"encoding/csv"
 	"encoding/json"
 	"fmt"
@@ -142,36 +143,30 @@ func (a *app) handleQuery(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 
 	start := time.Now()
-	rows, err := a.db.QueryContext(ctx, query)
+	result, err := a.executeSelectQuery(ctx, query)
 	if err != nil {
 		respondJSON(w, http.StatusBadRequest, queryResponse{Error: err.Error()})
 		return
 	}
-	defer rows.Close()
-
-	columns, err := rows.Columns()
-	if err != nil {
-		respondJSON(w, http.StatusInternalServerError, queryResponse{Error: err.Error()})
-		return
-	}
+	defer result.rows.Close()
 
 	resp := queryResponse{
-		Columns: columns,
+		Columns: result.columns,
 	}
 
-	for rows.Next() {
+	for result.rows.Next() {
 		if len(resp.Rows) >= limit {
 			resp.More = true
 			break
 		}
-		values, err := scanRow(rows, len(columns))
+		values, err := scanRow(result.rows, len(result.columns))
 		if err != nil {
 			respondJSON(w, http.StatusInternalServerError, queryResponse{Error: err.Error()})
 			return
 		}
 		resp.Rows = append(resp.Rows, normalizeRow(values))
 	}
-	if err := rows.Err(); err != nil {
+	if err := result.rows.Err(); err != nil {
 		respondJSON(w, http.StatusInternalServerError, queryResponse{Error: err.Error()})
 		return
 	}
@@ -203,18 +198,12 @@ func (a *app) handleExportCSV(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), queryTimeout)
 	defer cancel()
 
-	rows, err := a.db.QueryContext(ctx, query)
+	result, err := a.executeSelectQuery(ctx, query)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	defer rows.Close()
-
-	columns, err := rows.Columns()
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
+	defer result.rows.Close()
 
 	w.Header().Set("Content-Type", "text/csv")
 	w.Header().Set("Content-Disposition", "attachment; filename=export.csv")
@@ -222,16 +211,16 @@ func (a *app) handleExportCSV(w http.ResponseWriter, r *http.Request) {
 	csvWriter := csv.NewWriter(w)
 	defer csvWriter.Flush()
 
-	if err := csvWriter.Write(columns); err != nil {
+	if err := csvWriter.Write(result.columns); err != nil {
 		return
 	}
 
-	for rows.Next() {
-		values, err := scanRow(rows, len(columns))
+	for result.rows.Next() {
+		values, err := scanRow(result.rows, len(result.columns))
 		if err != nil {
 			return
 		}
-		record := make([]string, len(columns))
+		record := make([]string, len(result.columns))
 		for i, v := range values {
 			record[i] = formatCSVValue(v)
 		}
@@ -253,11 +242,8 @@ type generateSQLResponse struct {
 }
 
 func (a *app) handleGenerateSQL(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-
 	if a.llm == nil {
-		w.WriteHeader(http.StatusServiceUnavailable)
-		json.NewEncoder(w).Encode(generateSQLResponse{
+		respondJSON(w, http.StatusServiceUnavailable, generateSQLResponse{
 			Error: "LLM not configured. Set LLM_API_KEY environment variable.",
 		})
 		return
@@ -265,14 +251,12 @@ func (a *app) handleGenerateSQL(w http.ResponseWriter, r *http.Request) {
 
 	var req generateSQLRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(generateSQLResponse{Error: "invalid JSON body"})
+		respondJSON(w, http.StatusBadRequest, generateSQLResponse{Error: "invalid JSON body"})
 		return
 	}
 
 	if strings.TrimSpace(req.Prompt) == "" {
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(generateSQLResponse{Error: "prompt is required"})
+		respondJSON(w, http.StatusBadRequest, generateSQLResponse{Error: "prompt is required"})
 		return
 	}
 
@@ -286,26 +270,24 @@ func (a *app) handleGenerateSQL(w http.ResponseWriter, r *http.Request) {
 
 	resp, err := a.llm.GenerateSQL(ctx, llmReq)
 	if err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode(generateSQLResponse{Error: resp.Error})
+		respondJSON(w, http.StatusInternalServerError, generateSQLResponse{Error: resp.Error})
 		return
 	}
 
 	if resp.IsMissing() {
-		json.NewEncoder(w).Encode(generateSQLResponse{Missing: resp.Missing, Tokens: resp.Tokens})
+		respondJSON(w, http.StatusOK, generateSQLResponse{Missing: resp.Missing, Tokens: resp.Tokens})
 		return
 	}
 
 	// Validate the generated SQL
 	if _, err := validateSelectQuery(resp.SQL); err != nil {
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(generateSQLResponse{
+		respondJSON(w, http.StatusBadRequest, generateSQLResponse{
 			Error: "LLM generated invalid query: " + err.Error(),
 		})
 		return
 	}
 
-	json.NewEncoder(w).Encode(generateSQLResponse{SQL: resp.SQL, Tokens: resp.Tokens})
+	respondJSON(w, http.StatusOK, generateSQLResponse{SQL: resp.SQL, Tokens: resp.Tokens})
 }
 
 type schemaResponse struct {
@@ -315,8 +297,7 @@ type schemaResponse struct {
 }
 
 func (a *app) handleSchema(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(schemaResponse{
+	respondJSON(w, http.StatusOK, schemaResponse{
 		Tables:      a.schema.GetTables(),
 		TableCount:  a.schema.TableCount(),
 		LastRefresh: a.schema.GetLastRefresh().Format(time.RFC3339),
@@ -324,18 +305,15 @@ func (a *app) handleSchema(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *app) handleSchemaRefresh(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-
 	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 	defer cancel()
 
 	if err := a.schema.Load(ctx, a.db); err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		respondJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
 
-	json.NewEncoder(w).Encode(schemaResponse{
+	respondJSON(w, http.StatusOK, schemaResponse{
 		Tables:      a.schema.GetTables(),
 		TableCount:  a.schema.TableCount(),
 		LastRefresh: a.schema.GetLastRefresh().Format(time.RFC3339),
@@ -397,6 +375,29 @@ func validateSelectQuery(raw string) (string, error) {
 	return query, nil
 }
 
+// queryResult holds the result of executing a SELECT query.
+type queryResult struct {
+	rows    *sql.Rows
+	columns []string
+}
+
+// executeSelectQuery executes a SELECT query and returns the rows with column names.
+// The caller is responsible for closing the rows.
+func (a *app) executeSelectQuery(ctx context.Context, query string) (*queryResult, error) {
+	rows, err := a.db.QueryContext(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+
+	columns, err := rows.Columns()
+	if err != nil {
+		rows.Close()
+		return nil, err
+	}
+
+	return &queryResult{rows: rows, columns: columns}, nil
+}
+
 func scanRow(rows *sql.Rows, numCols int) ([]any, error) {
 	values := make([]any, numCols)
 	ptrs := make([]any, numCols)
@@ -416,541 +417,11 @@ func env(key, fallback string) string {
 	return fallback
 }
 
-func respondJSON(w http.ResponseWriter, status int, payload queryResponse) {
+func respondJSON(w http.ResponseWriter, status int, payload any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(payload)
 }
 
-// indexHTML is a small, self-contained UI for running ad-hoc queries.
-var indexHTML = `
-<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>DB Reader</title>
-  <style>
-    :root {
-      --bg: #0f1219;
-      --panel: #1a1f2e;
-      --panel-2: #161b26;
-      --text: #e2e8f0;
-      --muted: #8892a6;
-      --accent: #3b82f6;
-      --border: #2a3142;
-      --danger: #f87171;
-      --success: #4ade80;
-    }
-    * { box-sizing: border-box; }
-    body {
-      margin: 0;
-      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-      background: var(--bg);
-      color: var(--text);
-      min-height: 100vh;
-    }
-    main {
-      max-width: 1100px;
-      margin: 0 auto;
-      padding: 48px 24px 64px;
-    }
-    header {
-      display: flex;
-      justify-content: space-between;
-      align-items: baseline;
-      gap: 12px;
-      margin-bottom: 22px;
-    }
-    h1 {
-      font-size: 28px;
-      letter-spacing: -0.02em;
-      margin: 0;
-    }
-    p.lead {
-      margin: 4px 0 0;
-      color: var(--muted);
-    }
-    .card {
-      background: var(--panel);
-      border: 1px solid var(--border);
-      border-radius: 12px;
-      padding: 18px;
-    }
-    form {
-      display: grid;
-      gap: 12px;
-    }
-    label {
-      font-size: 13px;
-      color: var(--muted);
-      text-transform: uppercase;
-      letter-spacing: 0.04em;
-    }
-    textarea {
-      width: 100%;
-      min-height: 170px;
-      resize: vertical;
-      padding: 14px;
-      border-radius: 14px;
-      border: 1px solid var(--border);
-      background: var(--panel);
-      color: var(--text);
-      font-size: 14px;
-      line-height: 1.45;
-      font-family: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
-    }
-    textarea:focus {
-      outline: none;
-      border-color: var(--accent);
-    }
-    .controls {
-      display: flex;
-      align-items: center;
-      gap: 12px;
-      flex-wrap: wrap;
-      justify-content: space-between;
-    }
-    .control-group {
-      display: flex;
-      align-items: center;
-      gap: 10px;
-      color: var(--muted);
-      font-size: 13px;
-    }
-    input[type="number"] {
-      width: 90px;
-      padding: 8px 10px;
-      border-radius: 10px;
-      border: 1px solid var(--border);
-      background: var(--panel);
-      color: var(--text);
-    }
-    button {
-      appearance: none;
-      border: 0;
-      background: var(--accent);
-      color: #fff;
-      padding: 10px 18px;
-      border-radius: 8px;
-      font-weight: 600;
-      font-size: 14px;
-      cursor: pointer;
-      min-width: 120px;
-      transition: background 0.15s ease;
-    }
-    button:hover { background: #2563eb; }
-    button:active { background: #1d4ed8; }
-    button:disabled {
-      opacity: 0.5;
-      cursor: not-allowed;
-    }
-    .export-row {
-      display: flex;
-      justify-content: flex-end;
-      margin-top: 12px;
-    }
-    .export-btn {
-      display: inline-flex;
-      align-items: center;
-      gap: 6px;
-      background: transparent;
-      color: var(--muted);
-      border: 1px solid var(--border);
-      padding: 8px 12px;
-      font-size: 13px;
-      min-width: auto;
-    }
-    .export-btn:hover { color: var(--text); background: rgba(255,255,255,0.05); }
-    .export-btn:active { background: rgba(255,255,255,0.08); }
-    .status {
-      font-size: 13px;
-      color: var(--muted);
-      display: flex;
-      align-items: center;
-      gap: 10px;
-    }
-    .status strong { color: var(--text); }
-    .status .error { color: var(--danger); }
-    .status .success { color: var(--success); }
-    .preview {
-      margin-top: 16px;
-      background: var(--panel-2);
-      border: 1px solid var(--border);
-      border-radius: 12px;
-      padding: 12px;
-    }
-    .table-wrap {
-      max-height: 360px;
-      overflow: auto;
-      border-radius: 10px;
-    }
-    table {
-      border-collapse: collapse;
-      width: 100%;
-      min-width: 420px;
-      font-size: 13px;
-    }
-    th, td {
-      text-align: left;
-      padding: 10px 12px;
-      border-bottom: 1px solid var(--border);
-      white-space: nowrap;
-      max-width: 300px;
-      overflow: hidden;
-      text-overflow: ellipsis;
-    }
-    th {
-      position: sticky;
-      top: 0;
-      background: rgba(15, 23, 42, 0.95);
-      z-index: 2;
-      letter-spacing: 0.01em;
-    }
-    tbody tr:hover td { background: rgba(255, 255, 255, 0.04); }
-    .empty {
-      color: var(--muted);
-      text-align: center;
-      padding: 18px 0;
-      font-size: 14px;
-    }
-    .nl-section {
-      margin-bottom: 16px;
-    }
-    .nl-input-row {
-      display: flex;
-      gap: 10px;
-      align-items: stretch;
-    }
-    .nl-input {
-      flex: 1;
-      padding: 12px 14px;
-      border-radius: 10px;
-      border: 1px solid var(--border);
-      background: var(--panel);
-      color: var(--text);
-      font-size: 14px;
-    }
-    .nl-input:focus {
-      outline: none;
-      border-color: var(--accent);
-    }
-    .nl-input::placeholder {
-      color: var(--muted);
-    }
-    .generate-btn {
-      background: linear-gradient(135deg, #8b5cf6, #6366f1);
-      white-space: nowrap;
-    }
-    .generate-btn:hover {
-      background: linear-gradient(135deg, #7c3aed, #4f46e5);
-    }
-    .missing-info {
-      margin-top: 12px;
-      padding: 12px 14px;
-      background: rgba(251, 191, 36, 0.1);
-      border: 1px solid rgba(251, 191, 36, 0.3);
-      border-radius: 8px;
-      color: #fbbf24;
-      font-size: 13px;
-    }
-    .divider {
-      display: flex;
-      align-items: center;
-      gap: 12px;
-      margin: 16px 0;
-      color: var(--muted);
-      font-size: 12px;
-      text-transform: uppercase;
-      letter-spacing: 0.05em;
-    }
-    .divider::before, .divider::after {
-      content: '';
-      flex: 1;
-      height: 1px;
-      background: var(--border);
-    }
-  </style>
-</head>
-<body>
-  <main>
-    <header>
-      <div>
-        <h1>DB Reader</h1>
-        <p class="lead">Run ad-hoc SQL and preview results right in the browser.</p>
-      </div>
-      <div class="status" id="statusText"></div>
-    </header>
-
-    <section class="card">
-      <div class="nl-section">
-        <label for="nlInput">Ask in plain English</label>
-        <div class="nl-input-row">
-          <input type="text" id="nlInput" class="nl-input" placeholder="e.g., Show me the top 10 customers by order count" />
-          <button type="button" id="generateButton" class="generate-btn">Generate SQL</button>
-        </div>
-        <div id="missingInfo" class="missing-info" style="display: none;"></div>
-      </div>
-
-      <div class="divider">or write SQL directly</div>
-
-      <form id="queryForm">
-        <div>
-          <label for="queryInput">SQL Query</label>
-          <textarea id="queryInput" name="query" spellcheck="false">{{.DefaultQuery}}</textarea>
-        </div>
-        <div class="controls">
-          <div class="control-group">
-          <label for="limitInput">Max rows</label>
-          <input id="limitInput" name="limit" type="number" min="1" max="1000" value="{{.DefaultLimit}}" />
-          <span aria-hidden="true" style="color: var(--muted);">•</span>
-          <span class="muted">⌘/Ctrl + Enter to run</span>
-        </div>
-        <button type="submit" id="runButton">Run query</button>
-        </div>
-      </form>
-    </section>
-
-    <section class="preview">
-      <div class="table-wrap">
-        <table id="resultsTable" aria-live="polite"></table>
-        <div class="empty" id="emptyState">Run a query to see rows.</div>
-      </div>
-      <div class="export-row">
-        <button type="button" id="exportButton" class="export-btn" disabled>
-          <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M8 10V2M8 10L5 7M8 10L11 7"/>
-            <path d="M2 10v3a1 1 0 001 1h10a1 1 0 001-1v-3"/>
-          </svg>
-          CSV
-        </button>
-      </div>
-    </section>
-  </main>
-
-  <script>
-    const form = document.getElementById('queryForm');
-    const queryInput = document.getElementById('queryInput');
-    const limitInput = document.getElementById('limitInput');
-    const resultsTable = document.getElementById('resultsTable');
-    const emptyState = document.getElementById('emptyState');
-    const statusText = document.getElementById('statusText');
-    const runButton = document.getElementById('runButton');
-    const exportButton = document.getElementById('exportButton');
-    const nlInput = document.getElementById('nlInput');
-    const generateButton = document.getElementById('generateButton');
-    const missingInfo = document.getElementById('missingInfo');
-    const fallbackLimit = {{.DefaultLimit}};
-
-    form.addEventListener('submit', (e) => {
-      e.preventDefault();
-      runQuery();
-    });
-
-    queryInput.addEventListener('keydown', (e) => {
-      if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
-        e.preventDefault();
-        runQuery();
-      }
-    });
-
-    nlInput.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter') {
-        e.preventDefault();
-        generateSQL();
-      }
-    });
-
-    generateButton.addEventListener('click', generateSQL);
-    exportButton.addEventListener('click', exportCSV);
-
-    async function generateSQL() {
-      const prompt = nlInput.value.trim();
-      if (!prompt) {
-        setStatus('Enter a question to generate SQL.', 'error');
-        return;
-      }
-
-      missingInfo.style.display = 'none';
-      setStatus('Generating SQL...', 'muted');
-      generateButton.disabled = true;
-      generateButton.textContent = 'Generating...';
-
-      try {
-        const res = await fetch('/generate-sql', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ prompt })
-        });
-
-        const data = await res.json();
-
-        if (data.error) {
-          setStatus(data.error, 'error');
-          return;
-        }
-
-        if (data.missing) {
-          missingInfo.textContent = data.missing;
-          missingInfo.style.display = 'block';
-          setStatus('Cannot generate query for this request.', 'error');
-          return;
-        }
-
-        if (data.sql) {
-          queryInput.value = data.sql;
-          queryInput.focus();
-          const tokenInfo = data.tokens ? ' (' + data.tokens + ' tokens)' : '';
-          setStatus('SQL generated' + tokenInfo, 'success');
-        }
-      } catch (err) {
-        console.error(err);
-        setStatus('Generation failed. Check the server logs.', 'error');
-      } finally {
-        generateButton.disabled = false;
-        generateButton.textContent = 'Generate SQL';
-      }
-    }
-
-    async function runQuery() {
-      const query = queryInput.value.trim();
-      const limit = Number.parseInt(limitInput.value, 10) || fallbackLimit;
-
-      if (!query) {
-        setStatus('Enter a query to run.', 'error');
-        return;
-      }
-
-      setStatus('Running query...', 'muted');
-      toggleLoading(true);
-      clearResults();
-
-      try {
-        const res = await fetch('/query', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ query, limit })
-        });
-
-        const data = await res.json();
-        if (!res.ok || data.error) {
-          setStatus(data.error || 'Server error', 'error');
-          exportButton.disabled = true;
-          return;
-        }
-
-        const rows = data.rows || [];
-        renderTable(data.columns || [], rows);
-        exportButton.disabled = rows.length === 0;
-        const parts = [];
-        parts.push(data.count + ' row' + (data.count === 1 ? '' : 's'));
-        if (data.more) parts.push('truncated');
-        if (data.durationMs != null) parts.push(data.durationMs + ' ms');
-        setStatus(parts.join(' · '), 'success');
-      } catch (err) {
-        console.error(err);
-        setStatus('Request failed. Check the server logs.', 'error');
-        exportButton.disabled = true;
-      } finally {
-        toggleLoading(false);
-      }
-    }
-
-    async function exportCSV() {
-      const query = queryInput.value.trim();
-      if (!query) {
-        setStatus('Enter a query to export.', 'error');
-        return;
-      }
-
-      setStatus('Exporting CSV...', 'muted');
-      exportButton.disabled = true;
-
-      try {
-        const res = await fetch('/export', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ query })
-        });
-
-        if (!res.ok) {
-          const text = await res.text();
-          setStatus(text || 'Export failed', 'error');
-          return;
-        }
-
-        const blob = await res.blob();
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement('a');
-        a.href = url;
-        a.download = 'export.csv';
-        document.body.appendChild(a);
-        a.click();
-        document.body.removeChild(a);
-        URL.revokeObjectURL(url);
-        setStatus('CSV downloaded', 'success');
-      } catch (err) {
-        console.error(err);
-        setStatus('Export failed. Check the server logs.', 'error');
-      } finally {
-        exportButton.disabled = false;
-      }
-    }
-
-    function renderTable(columns, rows) {
-      resultsTable.innerHTML = '';
-      if (!rows.length) {
-        emptyState.textContent = 'No rows returned.';
-        emptyState.style.display = 'block';
-        return;
-      }
-
-      emptyState.style.display = 'none';
-      const thead = document.createElement('thead');
-      const headerRow = document.createElement('tr');
-      columns.forEach(col => {
-        const th = document.createElement('th');
-        th.textContent = col;
-        headerRow.appendChild(th);
-      });
-      thead.appendChild(headerRow);
-
-      const tbody = document.createElement('tbody');
-      rows.forEach(row => {
-        const tr = document.createElement('tr');
-        row.forEach(cell => {
-          const td = document.createElement('td');
-          const text = cell === null ? 'NULL' : String(cell);
-          td.textContent = text;
-          td.title = text;
-          tr.appendChild(td);
-        });
-        tbody.appendChild(tr);
-      });
-
-      resultsTable.appendChild(thead);
-      resultsTable.appendChild(tbody);
-    }
-
-    function clearResults() {
-      resultsTable.innerHTML = '';
-      emptyState.textContent = 'Running...';
-      emptyState.style.display = 'block';
-    }
-
-    function setStatus(message, tone) {
-      statusText.textContent = message || '';
-      statusText.className = 'status ' + (tone || '');
-    }
-
-    function toggleLoading(isLoading) {
-      runButton.disabled = isLoading;
-      runButton.textContent = isLoading ? 'Running...' : 'Run query';
-    }
-
-    // Autofocus for quick entry.
-    queryInput.focus();
-  </script>
-</body>
-</html>
-`
+//go:embed templates/index.html
+var indexHTML string

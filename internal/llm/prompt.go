@@ -42,37 +42,3 @@ LIMIT 100;
 User: "what's the weather today"
 MISSING: The database contains no weather-related tables. Available data includes customers, orders, and related business data. Weather information cannot be derived from the current schema.`, schema)
 }
-
-// BuildCapabilitiesPrompt constructs the prompt for generating capability suggestions.
-func BuildCapabilitiesPrompt(schema string) string {
-	return fmt.Sprintf(`You are analyzing a database schema to help users understand what questions they can ask.
-
-DATABASE SCHEMA:
-%s
-
-Generate a structured list of example questions this database can answer.
-
-RULES:
-1. Group questions by domain/theme (not by raw table name)
-2. Include simple questions (single table) and complex ones (joins, aggregations)
-3. Show the breadth of what's possible: counts, lookups, trends, comparisons, rankings
-4. Use natural, conversational phrasing that a non-technical user would use
-5. Be specific to the actual column names and relationships in the schema
-6. Include 3-5 examples per domain
-7. Create 3-5 domains based on the data available
-
-Respond with valid JSON in exactly this format:
-{
-  "domains": [
-    {
-      "name": "Domain Name",
-      "description": "Brief description of this category",
-      "examples": [
-        "Example question 1?",
-        "Example question 2?",
-        "Example question 3?"
-      ]
-    }
-  ]
-}`, schema)
-}

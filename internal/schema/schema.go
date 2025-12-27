@@ -71,20 +71,6 @@ func (c *Cache) GetTables() []Table {
 	return tables
 }
 
-// HasTable checks if a table exists in the cache.
-func (c *Cache) HasTable(name string) bool {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-
-	lower := strings.ToLower(name)
-	for _, t := range c.Tables {
-		if strings.ToLower(t.Name) == lower {
-			return true
-		}
-	}
-	return false
-}
-
 // ToText serializes the schema to a text format suitable for LLM prompts.
 func (c *Cache) ToText() string {
 	c.mu.RLock()

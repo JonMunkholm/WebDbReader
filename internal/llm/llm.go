@@ -37,11 +37,6 @@ func (r GenerateResponse) IsMissing() bool {
 	return r.Missing != "" && r.SQL == ""
 }
 
-// IsError returns true if the response contains an error.
-func (r GenerateResponse) IsError() bool {
-	return r.Error != ""
-}
-
 // Config holds LLM provider configuration.
 type Config struct {
 	Provider string // "openai" or "anthropic"

@@ -1,4 +1,5 @@
 .env
 webdbreader
+WebDbReader
 LLM_FEATURE_DESIGN.md
 PRODUCTION_READINESS.md
